@@ -1,3 +1,6 @@
+import json
+import sys
+import time
 import socket
 import numpy as np
 import gymnasium as gym
@@ -5,24 +8,57 @@ from gymnasium import spaces
 import torch
 import torch.nn as nn
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.callbacks import BaseCallback
 from sb3_contrib import MaskablePPO
 
-WIDTH, HEIGHT = 8, 8 # make dynamic
-CELLS = WIDTH*HEIGHT
 N_ACTIONS_PER_CELL = 30
 
+
+def log(event: str, **kwargs):
+    print(json.dumps({"ts": time.time(), "event": event, **kwargs}), flush=True)
+
+
+class LoggingCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.episode_rewards = []
+        self.current_reward = 0.0
+
+    def _on_step(self) -> bool:
+        reward = self.locals["rewards"][0]
+        done = self.locals["dones"][0]
+        self.current_reward += reward
+
+        log(
+            "step",
+            timestep=self.num_timesteps,
+            reward=float(reward),
+            done=bool(done),
+        )
+
+        if done:
+            self.episode_rewards.append(self.current_reward)
+            log(
+                "episode_end",
+                timestep=self.num_timesteps,
+                episode_return=self.current_reward,
+                episode=len(self.episode_rewards),
+            )
+            self.current_reward = 0.0
+
+        return True
+
+
 class GameFeatureExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.Space, features_dim: int = 256): 
-        # Done so the extractor knows my feature vector size
+    def __init__(self, observation_space: gym.Space, features_dim: int = 256):
         super().__init__(observation_space, features_dim)
-        
-        # observation space shape metadata
+
         n_input_channels = observation_space.shape[0]
         h = observation_space.shape[1]
         w = observation_space.shape[2]
 
         self.cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 16, kernel_size=3, padding = 1),
+            nn.Conv2d(n_input_channels, 16, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -35,9 +71,10 @@ class GameFeatureExtractor(BaseFeaturesExtractor):
         x = observations.float() / 255.0
         return self.cnn(x)
 
+
 class MacroRTSEnv(gym.Env):
     metadata = {"render_modes": []}
-    
+
     def __init__(self, host: str = "127.0.0.1", port: int = 9000):
         super().__init__()
         self.host = host
@@ -48,7 +85,6 @@ class MacroRTSEnv(gym.Env):
         self.cells = None
         self._connect()
 
-        # Channel-first image observation
         self.observation_space = spaces.Box(
             low=0,
             high=255,
@@ -56,29 +92,23 @@ class MacroRTSEnv(gym.Env):
             dtype=np.uint8,
         )
 
-        # 64 cells, each cell chooses one of 30 actions
         self.action_space = spaces.MultiDiscrete([N_ACTIONS_PER_CELL] * self.cells)
-
-        # Mask shape expected by MaskablePPO for MultiDiscrete is flattened:
-        # sum(action_dims) = 64 * 30 = 1920
         self._last_mask = np.ones((self.cells, N_ACTIONS_PER_CELL), dtype=bool)
 
     def _connect(self) -> None:
         if self.sock is not None:
             return
-
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.host, self.port))
         self._fetch_config()
 
     def _fetch_config(self) -> None:
-        print("fetching config")
         self.sock.sendall(bytes([4]))
-        data = self._recv_exact(2) # receiving width and height dynamically
-        print(f"got config: {data[0]}x{data[1]}")
+        data = self._recv_exact(2)
         self.width = data[0]
         self.height = data[1]
         self.cells = self.width * self.height
+        log("config_fetched", width=self.width, height=self.height, cells=self.cells)
 
     def _disconnect(self) -> None:
         if self.sock is not None:
@@ -97,15 +127,15 @@ class MacroRTSEnv(gym.Env):
         return bytes(data)
 
     def _recv_obs(self):
-        obs_size = self.cells * 4                 # 64 * 4 = 256 bytes
-        mask_size = self.cells * N_ACTIONS_PER_CELL  # 64 * 30 = 1920 bytes
-        total = obs_size + mask_size + 1    # + done flag
+        obs_size = self.cells * 4
+        mask_size = self.cells * N_ACTIONS_PER_CELL
+        total = obs_size + mask_size + 1
 
         data = self._recv_exact(total)
 
         obs = np.frombuffer(data[:obs_size], dtype=np.uint8).copy()
-        obs = obs.reshape(self.height, self.width, 4)   # server sends HWC
-        obs = obs.transpose(2, 0, 1)          # convert to CHW for SB3
+        obs = obs.reshape(self.height, self.width, 4)
+        obs = obs.transpose(2, 0, 1)
 
         mask = np.frombuffer(
             data[obs_size:obs_size + mask_size],
@@ -116,33 +146,23 @@ class MacroRTSEnv(gym.Env):
         return obs, mask, done
 
     def _encode_actions(self, action: np.ndarray) -> np.ndarray:
-        """
-        Encode each per-cell action into one byte:
-        upper bits = act, lower bits = direction
-        """
         encoded = np.zeros(self.cells, dtype=np.uint8)
-
         for i, a in enumerate(action):
             a = int(a)
             act = a // 5
             direction = a % 5
             encoded[i] = (act << 4) | direction
-
         return encoded
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-
         if self.sock is None:
             self._connect()
-
-        # Command 0 = reset
         self.sock.sendall(bytes([0]))
         obs, mask, _done = self._recv_obs()
-
         self._last_mask = mask
-        info = {}
-        return obs, info
+        log("episode_reset")
+        return obs, {}
 
     def step(self, action):
         action = np.asarray(action, dtype=np.int64)
@@ -150,8 +170,6 @@ class MacroRTSEnv(gym.Env):
             raise ValueError(f"Expected action shape {(self.cells,)}, got {action.shape}")
 
         encoded = self._encode_actions(action)
-
-        # Command 1 = step
         self.sock.sendall(bytes([1]))
         self.sock.sendall(encoded.tobytes())
 
@@ -159,58 +177,50 @@ class MacroRTSEnv(gym.Env):
         self._last_mask = mask
 
         reward = self._reward(obs)
-        terminated = done
-        truncated = False
-        info = {}
-
-        return obs, reward, terminated, truncated, info
+        return obs, reward, done, False, {}
 
     def _reward(self, obs: np.ndarray) -> float:
-        """
-        obs is channel-first: (C, H, W)
-        Assume channel 1 is 'player ownership'
-        """
         players = obs[1, :, :]
         friendly = np.sum(players == 1)
         enemy = np.sum(players == 2)
+        log("reward", friendly=int(friendly), enemy=int(enemy), reward=float(friendly - enemy) * 0.01)
         return float(friendly - enemy) * 0.01
 
     def action_masks(self) -> np.ndarray:
-        """
-        MaskablePPO expects a flat mask for MultiDiscrete:
-        shape = (sum(nvec),) for a single env.
-        """
         return self._last_mask.reshape(-1)
 
     def close(self):
+        log("env_close")
         self._disconnect()
 
 
 def main():
-        env = MacroRTSEnv()
+    log("training_start")
+    env = MacroRTSEnv()
 
-        policy_kwargs = dict(
-            features_extractor_class=GameFeatureExtractor,
-            features_extractor_kwargs=dict(features_dim=256),
-            normalize_images=False,  # extractor already scales by /255.0
-        )
+    policy_kwargs = dict(
+        features_extractor_class=GameFeatureExtractor,
+        features_extractor_kwargs=dict(features_dim=256),
+        normalize_images=False,
+    )
 
-        model = MaskablePPO(
-            policy="CnnPolicy",
-            env=env,
-            policy_kwargs=policy_kwargs,
-            learning_rate=2.5e-4,
-            n_steps=512,
-            batch_size=64,
-            verbose=1,
-            tensorboard_log="./tb_logs/",
-        )
+    model = MaskablePPO(
+        policy="CnnPolicy",
+        env=env,
+        policy_kwargs=policy_kwargs,
+        learning_rate=2.5e-4,
+        n_steps=512,
+        batch_size=64,
+        verbose=0,
+        tensorboard_log="./tb_logs/",
+    )
 
-        model.learn(total_timesteps=100_000)
-        model.save("macrorts_ppo")
-        env.close()
+    model.learn(total_timesteps=100_000, callback=LoggingCallback())
+    log("training_complete", total_timesteps=100_000)
+    model.save("macrorts_ppo")
+    log("model_saved", path="macrorts_ppo")
+    env.close()
 
 
 if __name__ == "__main__":
     main()
-
